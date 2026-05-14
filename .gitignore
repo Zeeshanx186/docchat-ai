@@ -1,0 +1,8 @@
+ai_catalog_env/
+venv/
+.env
+*.ipynb
+__pycache__/
+*.pyc
+.DS_Store
+temp_*
