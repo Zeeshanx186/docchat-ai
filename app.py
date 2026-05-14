@@ -1,11 +1,4 @@
 # app.py
-
-# Replace this at the top of app.py:
-from dotenv import load_dotenv
-load_dotenv()
-
-
-
 import os
 import json
 import uuid
@@ -25,16 +18,21 @@ from langchain_classic.retrievers import EnsembleRetriever
 from sentence_transformers import CrossEncoder
 
 # ── Config ───────────────────────────────────────────
-FAISS_PATH    = "/var/tmp/faiss_db"
-CHUNKS_PATH   = "/var/tmp/faiss_db/chunks.pkl"
-PARENTS_PATH  = "/var/tmp/faiss_db/parents.pkl"
-CHATS_DIR     = "/var/tmp/rag_chats"
-CHUNK_SIZE    = 1000
-CHUNK_OVERLAP = 200
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+BASE_DIR     = os.path.join(os.path.expanduser("~"), ".docchat")
+FAISS_PATH   = os.path.join(BASE_DIR, "faiss_db")
+CHUNKS_PATH  = os.path.join(BASE_DIR, "faiss_db", "chunks.pkl")
+PARENTS_PATH = os.path.join(BASE_DIR, "faiss_db", "parents.pkl")
+CHATS_DIR    = os.path.join(BASE_DIR, "rag_chats")
 
-
+os.makedirs(FAISS_PATH, exist_ok=True)
 os.makedirs(CHATS_DIR, exist_ok=True)
+
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except:
+    from dotenv import load_dotenv
+    load_dotenv()
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # ── Page setup ───────────────────────────────────────
 st.set_page_config(
@@ -47,64 +45,239 @@ st.set_page_config(
 # ── Custom CSS ───────────────────────────────────────
 st.markdown("""
 <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+    /* ── Reset & Base ─────────────────────────────── */
+    #MainMenu, footer, header {visibility: hidden;}
+    * {box-sizing: border-box;}
+
+    /* ── App Background ───────────────────────────── */
     .stApp {
-        background: linear-gradient(135deg, #0f0f1e 0%, #1a1a2e 100%);
+        background: #0a0a0f;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
+
+    /* ── Main content area ────────────────────────── */
+    .main .block-container {
+        padding: 1rem 1.5rem 6rem 1.5rem;
+        max-width: 860px;
+        margin: 0 auto;
+    }
+
+    /* ── Title ────────────────────────────────────── */
     h1 {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        font-size: clamp(1.4rem, 4vw, 2rem) !important;
+        font-weight: 700 !important;
+        letter-spacing: -0.5px;
+        background: linear-gradient(135deg, #a78bfa, #60a5fa, #34d399);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        font-weight: 800 !important;
-        font-size: 2.5rem !important;
+        margin-bottom: 0 !important;
     }
+
+    /* ── Caption ──────────────────────────────────── */
+    .stApp p, .stApp .stCaption {
+        color: #6b7280 !important;
+        font-size: 0.8rem !important;
+    }
+
+    /* ── Sidebar ──────────────────────────────────── */
     [data-testid="stSidebar"] {
-        background: rgba(20, 20, 35, 0.95);
-        border-right: 1px solid rgba(102, 126, 234, 0.2);
+        background: #0f0f17 !important;
+        border-right: 1px solid #1f1f2e;
+        padding: 1rem 0.8rem;
     }
-    [data-testid="stChatMessage"] {
-        background: rgba(30, 30, 50, 0.6);
-        border-radius: 16px;
-        padding: 1rem 1.2rem;
-        margin: 0.5rem 0;
-        border: 1px solid rgba(102, 126, 234, 0.15);
+    [data-testid="stSidebar"] * {
+        color: #e2e8f0 !important;
     }
-    .stButton button {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border: none;
-        border-radius: 10px;
-        font-weight: 600;
-        padding: 0.5rem 1rem;
-        transition: transform 0.2s;
+
+    /* ── Sidebar section headers ──────────────────── */
+    [data-testid="stSidebar"] h3 {
+        font-size: 0.7rem !important;
+        font-weight: 600 !important;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        color: #4b5563 !important;
+        margin: 1.2rem 0 0.5rem 0 !important;
     }
-    .stButton button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-    }
+
+    /* ── File uploader ────────────────────────────── */
     [data-testid="stFileUploader"] {
-        background: rgba(102, 126, 234, 0.05);
-        border: 2px dashed rgba(102, 126, 234, 0.3);
+        background: #13131f;
+        border: 1.5px dashed #2d2d44;
         border-radius: 12px;
-        padding: 1rem;
+        padding: 0.8rem;
+        transition: border-color 0.2s;
     }
-    [data-testid="stChatInput"] {
-        background: rgba(30, 30, 50, 0.8);
+    [data-testid="stFileUploader"]:hover {
+        border-color: #a78bfa;
+    }
+
+    /* ── Main buttons ─────────────────────────────── */
+    .stButton > button {
+        background: linear-gradient(135deg, #7c3aed, #4f46e5) !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 10px !important;
+        font-weight: 600 !important;
+        font-size: 0.85rem !important;
+        padding: 0.5rem 1rem !important;
+        transition: all 0.2s !important;
+        width: 100%;
+        letter-spacing: 0.3px;
+    }
+    .stButton > button:hover {
+        transform: translateY(-1px) !important;
+        box-shadow: 0 4px 20px rgba(124, 58, 237, 0.35) !important;
+    }
+    .stButton > button:active {
+        transform: translateY(0) !important;
+    }
+
+    /* ── Toggle ───────────────────────────────────── */
+    [data-testid="stToggle"] {
+        margin: 0.3rem 0;
+    }
+
+    /* ── Divider ──────────────────────────────────── */
+    hr {
+        border-color: #1f1f2e !important;
+        margin: 0.8rem 0 !important;
+    }
+
+    /* ── Chat history buttons ─────────────────────── */
+    [data-testid="stSidebar"] .stButton > button {
+        background: transparent !important;
+        border: 1px solid #1f1f2e !important;
+        border-radius: 8px !important;
+        color: #9ca3af !important;
+        font-size: 0.78rem !important;
+        font-weight: 400 !important;
+        text-align: left !important;
+        padding: 0.4rem 0.7rem !important;
+        margin: 0.15rem 0 !important;
+        transition: all 0.15s !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        background: #1a1a2e !important;
+        border-color: #7c3aed !important;
+        color: #e2e8f0 !important;
+        transform: none !important;
+        box-shadow: none !important;
+    }
+
+    /* ── User chat message ────────────────────────── */
+    [data-testid="stChatMessage"] {
+        background: #13131f;
+        border: 1px solid #1f1f2e;
         border-radius: 16px;
-        border: 1px solid rgba(102, 126, 234, 0.3);
+        padding: 0.8rem 1rem;
+        margin: 0.4rem 0;
     }
+
+    /* ── Chat message text ────────────────────────── */
+    [data-testid="stChatMessageContent"] {
+        font-size: clamp(0.85rem, 2.5vw, 0.95rem) !important;
+        line-height: 1.7 !important;
+        color: #e2e8f0 !important;
+    }
+
+    /* ── Chat input ───────────────────────────────── */
+    [data-testid="stChatInput"] {
+        background: #13131f !important;
+        border: 1.5px solid #2d2d44 !important;
+        border-radius: 14px !important;
+        padding: 0.6rem 1rem !important;
+        transition: border-color 0.2s !important;
+    }
+    [data-testid="stChatInput"]:focus-within {
+        border-color: #7c3aed !important;
+        box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.1) !important;
+    }
+    [data-testid="stChatInput"] textarea {
+        font-size: 16px !important;
+        color: #e2e8f0 !important;
+        background: transparent !important;
+    }
+
+    /* ── Expander (sources) ───────────────────────── */
     [data-testid="stExpander"] {
-        background: rgba(102, 126, 234, 0.05);
-        border-radius: 10px;
-        border: 1px solid rgba(102, 126, 234, 0.15);
+        background: #0f0f17 !important;
+        border: 1px solid #1f1f2e !important;
+        border-radius: 10px !important;
+        margin-top: 0.4rem !important;
+    }
+    [data-testid="stExpander"] summary {
+        font-size: 0.78rem !important;
+        color: #6b7280 !important;
+        font-weight: 500 !important;
+    }
+
+    /* ── Info/Alert box ───────────────────────────── */
+    [data-testid="stAlert"] {
+        background: #13131f !important;
+        border: 1px solid #1f1f2e !important;
+        border-radius: 12px !important;
+        color: #9ca3af !important;
+        font-size: 0.85rem !important;
+    }
+
+    /* ── Caption / confidence badge ───────────────── */
+    .stCaption {
+        font-size: 0.72rem !important;
+        color: #4b5563 !important;
+        margin-top: 0.2rem !important;
+    }
+
+    /* ── Spinner ──────────────────────────────────── */
+    [data-testid="stSpinner"] {
+        color: #7c3aed !important;
+    }
+
+    /* ── Scrollbar ────────────────────────────────── */
+    ::-webkit-scrollbar {width: 4px; height: 4px;}
+    ::-webkit-scrollbar-track {background: #0a0a0f;}
+    ::-webkit-scrollbar-thumb {
+        background: #2d2d44;
+        border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {background: #7c3aed;}
+
+    /* ── Mobile ───────────────────────────────────── */
+    @media (max-width: 768px) {
+        .main .block-container {
+            padding: 0.8rem 0.8rem 5rem 0.8rem;
+        }
+        h1 {font-size: 1.3rem !important;}
+        [data-testid="stChatMessage"] {
+            padding: 0.6rem 0.8rem;
+        }
+        [data-testid="stChatMessageContent"] {
+            font-size: 0.88rem !important;
+        }
+    }
+
+    /* ── Welcome screen ───────────────────────────── */
+    .welcome-box {
+        text-align: center;
+        padding: 3rem 1rem;
+    }
+    .welcome-box h2 {
+        font-size: 1.1rem;
+        color: #6b7280;
+        font-weight: 500;
+        margin-bottom: 0.5rem;
+    }
+    .welcome-box p {
+        font-size: 0.82rem;
+        color: #374151;
+        margin: 0.2rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Header ───────────────────────────────────────────
 st.markdown("# 🧠 DocChat AI")
-st.caption("Chat with your documents — powered by Hybrid RAG + Reranking + Parent Document Retriever")
+st.caption("Hybrid RAG · Reranking · Parent Document Retrieval")
 
 # ── Chat persistence ─────────────────────────────────
 def save_chat(chat_id, messages, title):
@@ -130,7 +303,7 @@ def delete_chat(chat_id):
     if os.path.exists(path):
         os.remove(path)
 
-# ── Embeddings + Reranker + LLM (cached) ─────────────
+# ── Embeddings + Reranker + LLM ──────────────────────
 @st.cache_resource
 def load_embeddings():
     return HuggingFaceEmbeddings(
@@ -194,7 +367,7 @@ Question: {question}
 
 Answer: {answer}
 
-Is the answer broadly supported by the context, without any significant fabricated claims? Reply with ONLY one of:
+Is the answer broadly supported by the context, without any significant fabricated claims? Note: if the answer admits it cannot find certain information, that is GROUNDED behaviour, not a hallucination. Reply with ONLY one of:
 GROUNDED - answer is fully or mostly supported
 PARTIAL - answer contains some claims not clearly in the context
 HALLUCINATED - answer contains significant fabricated information not in the context at all"""
@@ -203,7 +376,7 @@ HALLUCINATED - answer contains significant fabricated information not in the con
         result = result.content
     return result.strip()
 
-# ── Ingest files (Parent Document Retriever) ──────────
+# ── Ingest files ──────────────────────────────────────
 def ingest_files(file_paths, append=False):
     new_parent_chunks = []
     new_child_chunks  = []
@@ -213,7 +386,6 @@ def ingest_files(file_paths, append=False):
         chunk_size=3000,
         chunk_overlap=200
     )
-
     child_splitter = RecursiveCharacterTextSplitter(
         chunk_size=200,
         chunk_overlap=20
@@ -261,16 +433,17 @@ def ingest_files(file_paths, append=False):
         all_children = new_child_chunks
         all_parents  = new_parent_chunks
 
-    parent_lookup = {
-        p.metadata["parent_id"]: p for p in all_parents
-    }
+    if not all_children:
+        st.error("No text could be extracted. The file may be scanned or image-based.")
+        return None, None, None, None, None
+
+    parent_lookup = {p.metadata["parent_id"]: p for p in all_parents}
 
     db = FAISS.from_documents(all_children, embeddings)
     db.save_local(FAISS_PATH)
 
     with open(CHUNKS_PATH, "wb") as f:
         pickle.dump(all_children, f)
-
     with open(PARENTS_PATH, "wb") as f:
         pickle.dump(parent_lookup, f)
 
@@ -293,7 +466,7 @@ def load_existing_db():
             return None, None, None
     return None, None, None
 
-# ── Hybrid RAG chain with PDR ─────────────────────────
+# ── Hybrid RAG chain ──────────────────────────────────
 def build_chain(db, all_children, parent_lookup):
     prompt = PromptTemplate(
         template="""You are an expert assistant analyzing documents. Answer the question thoroughly using the context below.
@@ -419,19 +592,18 @@ with st.sidebar:
             saved_paths.append(p)
 
         with st.spinner(f"Ingesting {len(saved_paths)} file(s)..."):
-            db, all_children, all_parents, parent_lookup, file_stats = ingest_files(
-                saved_paths, append=append_mode
-            )
+            result = ingest_files(saved_paths, append=append_mode)
             for p in saved_paths:
                 os.remove(p)
 
-        chain, retriever = build_chain(db, all_children, parent_lookup)
-        st.session_state.rag_chain   = chain
-        st.session_state.retriever   = retriever
-
-        st.success(f"✅ {len(file_stats)} file(s) ingested")
-        for name, pages, parents, children in file_stats:
-            st.caption(f"📄 {name} • {pages}p • {parents} parents • {children} children")
+        if result[0] is not None:
+            db, all_children, all_parents, parent_lookup, file_stats = result
+            chain, retriever = build_chain(db, all_children, parent_lookup)
+            st.session_state.rag_chain = chain
+            st.session_state.retriever = retriever
+            st.success(f"✅ {len(file_stats)} file(s) ingested")
+            for name, pages, parents, children in file_stats:
+                st.caption(f"📄 {name} • {pages}p • {parents} parents • {children} children")
 
     if "rag_chain" not in st.session_state:
         existing_db, existing_children, existing_parents = load_existing_db()
@@ -457,7 +629,7 @@ with st.sidebar:
             col_a, col_b = st.columns([5, 1])
             with col_a:
                 if st.button(
-                    f"💬 {c['title'][:30]}",
+                    f"💬 {c['title'][:28]}",
                     key=f"load_{c['id']}",
                     use_container_width=True
                 ):
@@ -472,7 +644,13 @@ with st.sidebar:
 
 # ── Main chat ────────────────────────────────────────
 if "rag_chain" not in st.session_state:
-    st.info("👈 Upload documents from the sidebar to get started!")
+    st.markdown("""
+    <div class="welcome-box">
+        <h2>Upload a document to get started</h2>
+        <p>Supports PDF, Excel, and Word files</p>
+        <p>Powered by Hybrid RAG · Reranking · Parent Document Retrieval</p>
+    </div>
+    """, unsafe_allow_html=True)
 else:
     st.markdown(f"#### {st.session_state.chat_title}")
 
