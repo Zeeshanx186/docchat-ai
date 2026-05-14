@@ -12,3 +12,4 @@ pypdf
 openpyxl
 python-docx
 python-dotenv
+torchvision
