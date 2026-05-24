@@ -17,12 +17,16 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from sentence_transformers import CrossEncoder
 
+# ── Session ID (must be first) ───────────────────────
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())[:8]
+
 # ── Config ───────────────────────────────────────────
 BASE_DIR     = os.path.join(os.path.expanduser("~"), ".docchat")
 FAISS_PATH   = os.path.join(BASE_DIR, "faiss_db")
 CHUNKS_PATH  = os.path.join(BASE_DIR, "faiss_db", "chunks.pkl")
 PARENTS_PATH = os.path.join(BASE_DIR, "faiss_db", "parents.pkl")
-CHATS_DIR    = os.path.join(BASE_DIR, "rag_chats")
+CHATS_DIR    = os.path.join(BASE_DIR, "rag_chats", st.session_state.session_id)
 
 os.makedirs(FAISS_PATH, exist_ok=True)
 os.makedirs(CHATS_DIR, exist_ok=True)
@@ -45,24 +49,20 @@ st.set_page_config(
 # ── Custom CSS ───────────────────────────────────────
 st.markdown("""
 <style>
-    /* ── Reset & Base ─────────────────────────────── */
     #MainMenu, footer, header {visibility: hidden;}
     * {box-sizing: border-box;}
 
-    /* ── App Background ───────────────────────────── */
     .stApp {
         background: #0a0a0f;
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
-    /* ── Main content area ────────────────────────── */
     .main .block-container {
         padding: 1rem 1.5rem 6rem 1.5rem;
         max-width: 860px;
         margin: 0 auto;
     }
 
-    /* ── Title ────────────────────────────────────── */
     h1 {
         font-size: clamp(1.4rem, 4vw, 2rem) !important;
         font-weight: 700 !important;
@@ -73,13 +73,11 @@ st.markdown("""
         margin-bottom: 0 !important;
     }
 
-    /* ── Caption ──────────────────────────────────── */
     .stApp p, .stApp .stCaption {
         color: #6b7280 !important;
         font-size: 0.8rem !important;
     }
 
-    /* ── Sidebar ──────────────────────────────────── */
     [data-testid="stSidebar"] {
         background: #0f0f17 !important;
         border-right: 1px solid #1f1f2e;
@@ -89,7 +87,6 @@ st.markdown("""
         color: #e2e8f0 !important;
     }
 
-    /* ── Sidebar section headers ──────────────────── */
     [data-testid="stSidebar"] h3 {
         font-size: 0.7rem !important;
         font-weight: 600 !important;
@@ -99,7 +96,6 @@ st.markdown("""
         margin: 1.2rem 0 0.5rem 0 !important;
     }
 
-    /* ── File uploader ────────────────────────────── */
     [data-testid="stFileUploader"] {
         background: #13131f;
         border: 1.5px dashed #2d2d44;
@@ -111,7 +107,6 @@ st.markdown("""
         border-color: #a78bfa;
     }
 
-    /* ── Main buttons ─────────────────────────────── */
     .stButton > button {
         background: linear-gradient(135deg, #7c3aed, #4f46e5) !important;
         color: white !important;
@@ -132,18 +127,15 @@ st.markdown("""
         transform: translateY(0) !important;
     }
 
-    /* ── Toggle ───────────────────────────────────── */
     [data-testid="stToggle"] {
         margin: 0.3rem 0;
     }
 
-    /* ── Divider ──────────────────────────────────── */
     hr {
         border-color: #1f1f2e !important;
         margin: 0.8rem 0 !important;
     }
 
-    /* ── Chat history buttons ─────────────────────── */
     [data-testid="stSidebar"] .stButton > button {
         background: transparent !important;
         border: 1px solid #1f1f2e !important;
@@ -165,7 +157,6 @@ st.markdown("""
         box-shadow: none !important;
     }
 
-    /* ── User chat message ────────────────────────── */
     [data-testid="stChatMessage"] {
         background: #13131f;
         border: 1px solid #1f1f2e;
@@ -174,14 +165,12 @@ st.markdown("""
         margin: 0.4rem 0;
     }
 
-    /* ── Chat message text ────────────────────────── */
     [data-testid="stChatMessageContent"] {
         font-size: clamp(0.85rem, 2.5vw, 0.95rem) !important;
         line-height: 1.7 !important;
         color: #e2e8f0 !important;
     }
 
-    /* ── Chat input ───────────────────────────────── */
     [data-testid="stChatInput"] {
         background: #13131f !important;
         border: 1.5px solid #2d2d44 !important;
@@ -199,7 +188,6 @@ st.markdown("""
         background: transparent !important;
     }
 
-    /* ── Expander (sources) ───────────────────────── */
     [data-testid="stExpander"] {
         background: #0f0f17 !important;
         border: 1px solid #1f1f2e !important;
@@ -212,7 +200,6 @@ st.markdown("""
         font-weight: 500 !important;
     }
 
-    /* ── Info/Alert box ───────────────────────────── */
     [data-testid="stAlert"] {
         background: #13131f !important;
         border: 1px solid #1f1f2e !important;
@@ -221,19 +208,16 @@ st.markdown("""
         font-size: 0.85rem !important;
     }
 
-    /* ── Caption / confidence badge ───────────────── */
     .stCaption {
         font-size: 0.72rem !important;
         color: #4b5563 !important;
         margin-top: 0.2rem !important;
     }
 
-    /* ── Spinner ──────────────────────────────────── */
     [data-testid="stSpinner"] {
         color: #7c3aed !important;
     }
 
-    /* ── Scrollbar ────────────────────────────────── */
     ::-webkit-scrollbar {width: 4px; height: 4px;}
     ::-webkit-scrollbar-track {background: #0a0a0f;}
     ::-webkit-scrollbar-thumb {
@@ -242,7 +226,6 @@ st.markdown("""
     }
     ::-webkit-scrollbar-thumb:hover {background: #7c3aed;}
 
-    /* ── Mobile ───────────────────────────────────── */
     @media (max-width: 768px) {
         .main .block-container {
             padding: 0.8rem 0.8rem 5rem 0.8rem;
@@ -256,7 +239,6 @@ st.markdown("""
         }
     }
 
-    /* ── Welcome screen ───────────────────────────── */
     .welcome-box {
         text-align: center;
         padding: 3rem 1rem;
