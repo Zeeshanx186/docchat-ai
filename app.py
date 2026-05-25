@@ -20,9 +20,11 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from sentence_transformers import CrossEncoder
 
+# ── 1. Session ID ─────────────────────────────────────
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())[:8]
 
+# ── 2. Config ─────────────────────────────────────────
 BASE_DIR     = os.path.join(os.path.expanduser("~"), ".docchat")
 FAISS_PATH   = os.path.join(BASE_DIR, "faiss_db")
 CHUNKS_PATH  = os.path.join(BASE_DIR, "faiss_db", "chunks.pkl")
@@ -39,6 +41,7 @@ except:
     load_dotenv()
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# ── 3. Page setup ─────────────────────────────────────
 st.set_page_config(
     page_title="DocChat AI",
     page_icon="🧠",
@@ -46,12 +49,11 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# ── 4. CSS ────────────────────────────────────────────
 st.markdown("""
 <style>
 #MainMenu, footer, header {visibility: hidden;}
 * {box-sizing: border-box;}
-
-/* Force sidebar always visible */
 [data-testid="stSidebar"] {
     display: block !important;
     visibility: visible !important;
@@ -64,7 +66,6 @@ section[data-testid="stSidebarContent"] {
     visibility: visible !important;
 }
 [data-testid="stSidebar"] > div {padding: 0 !important;}
-
 .stApp {
     background: #0a0a0e;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -84,7 +85,6 @@ h1 {
 }
 h2, h3, h4 {color: #e2e8f0 !important; font-weight: 600 !important;}
 p, .stCaption, label {color: #6b7280 !important; font-size: 0.78rem !important;}
-
 [data-testid="stFileUploader"] {
     background: #0c0c12;
     border: 1.5px dashed #1c1c28;
@@ -92,7 +92,6 @@ p, .stCaption, label {color: #6b7280 !important; font-size: 0.78rem !important;}
     padding: 0.6rem;
 }
 [data-testid="stFileUploader"]:hover {border-color: #f59e0b;}
-
 .stButton > button {
     background: linear-gradient(135deg, #d97706, #f59e0b) !important;
     color: #0a0a0e !important;
@@ -162,7 +161,6 @@ hr {border-color: #1c1c28 !important; margin: 0.5rem 0 !important;}
 ::-webkit-scrollbar-track {background: #0a0a0e;}
 ::-webkit-scrollbar-thumb {background: #2a2a3a; border-radius: 3px;}
 ::-webkit-scrollbar-thumb:hover {background: #f59e0b;}
-
 .chunk-card {
     border-radius: 10px;
     padding: 0.7rem 0.9rem;
@@ -224,10 +222,7 @@ hr {border-color: #1c1c28 !important; margin: 0.5rem 0 !important;}
     margin: 0.8rem 0 0.3rem 0;
     padding: 0 14px;
 }
-.welcome-box {
-    text-align: center;
-    padding: 4rem 2rem;
-}
+.welcome-box {text-align: center; padding: 4rem 2rem;}
 @media (max-width: 768px) {
     .main .block-container {padding: 0.5rem 0.5rem 5rem 0.5rem;}
     h1 {font-size: 1.1rem !important;}
@@ -235,7 +230,7 @@ hr {border-color: #1c1c28 !important; margin: 0.5rem 0 !important;}
 </style>
 """, unsafe_allow_html=True)
 
-
+# ── 5. Chat persistence helpers ───────────────────────
 def save_chat(chat_id, messages, title):
     path = os.path.join(CHATS_DIR, f"{chat_id}.json")
     with open(path, "w") as f:
@@ -264,7 +259,11 @@ def time_label(iso):
     except:
         return ""
 
+def format_history(messages, last_n=4):
+    recent = messages[-last_n*2:]
+    return "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in recent) if recent else "No prior conversation."
 
+# ── 6. Model loaders ──────────────────────────────────
 @st.cache_resource
 def load_embeddings():
     return HuggingFaceEmbeddings(
@@ -281,7 +280,227 @@ def load_reranker():
 def load_llm():
     return ChatGroq(api_key=GROQ_API_KEY, model="openai/gpt-oss-120b", temperature=0)
 
-# Load models with visible status
+# ── 7. Query helpers ──────────────────────────────────
+def expand_query(query):
+    prompt = f"""Generate 8-10 additional keywords to help find relevant information. Return ONLY the expanded query as a single line.
+
+Original: {query}
+Expanded:"""
+    r = llm.invoke(prompt)
+    text = r.content if hasattr(r, "content") else r
+    return f"{query} {text}"
+
+def rewrite_query(question, history):
+    if not history or history == "No prior conversation.":
+        return question
+    prompt = f"""Rewrite the question to be fully self-contained. Return ONLY the rewritten question.
+
+History:
+{history}
+
+Question: {question}
+Rewritten:"""
+    r = llm.invoke(prompt)
+    text = r.content if hasattr(r, "content") else r
+    return text.strip()
+
+def check_hallucination(question, answer, source_docs):
+    context = "\n\n".join(doc.page_content for doc in source_docs)
+    prompt = f"""Fact-check: is the answer supported by the context?
+Note: admitting missing info = GROUNDED.
+
+Context:
+{context[:6000]}
+
+Question: {question}
+Answer: {answer}
+
+Reply ONLY with one of:
+GROUNDED - fully or mostly supported
+PARTIAL - some claims not in context
+HALLUCINATED - significant fabricated info"""
+    r = llm.invoke(prompt)
+    text = r.content if hasattr(r, "content") else r
+    return text.strip()
+
+# ── 8. Ingest ─────────────────────────────────────────
+def ingest_files(file_paths, append=False):
+    new_parents, new_children, file_stats = [], [], []
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200)
+    child_splitter  = RecursiveCharacterTextSplitter(chunk_size=200,  chunk_overlap=20)
+
+    for file_path in file_paths:
+        ext      = os.path.splitext(file_path)[-1].lower()
+        filename = os.path.basename(file_path).replace("temp_", "")
+        if ext == ".pdf":
+            loader = PyPDFLoader(file_path)
+        elif ext in [".xlsx", ".xls"]:
+            loader = UnstructuredExcelLoader(file_path, mode="elements")
+        elif ext in [".docx", ".doc"]:
+            loader = Docx2txtLoader(file_path)
+        else:
+            st.warning(f"Skipping: {filename}")
+            continue
+
+        docs = loader.load()
+        for d in docs:
+            d.metadata["source_file"] = filename
+
+        parents = parent_splitter.split_documents(docs)
+        for i, p in enumerate(parents):
+            p.metadata["parent_id"] = f"{filename}_{i}"
+        new_parents.extend(parents)
+
+        for i, p in enumerate(parents):
+            children = child_splitter.split_documents([p])
+            for c in children:
+                c.metadata["parent_id"] = f"{filename}_{i}"
+            new_children.extend(children)
+
+        file_stats.append((filename, len(docs), len(parents), len(new_children)))
+
+    if append and os.path.exists(CHUNKS_PATH) and os.path.exists(PARENTS_PATH):
+        with open(CHUNKS_PATH, "rb") as f:
+            existing_children = pickle.load(f)
+        with open(PARENTS_PATH, "rb") as f:
+            existing_parents = pickle.load(f)
+        all_children = existing_children + new_children
+        all_parents  = existing_parents  + new_parents
+    else:
+        all_children = new_children
+        all_parents  = new_parents
+
+    if not all_children:
+        st.error("No text extracted. File may be scanned/image-based.")
+        return None, None, None, None, None
+
+    parent_lookup = {p.metadata["parent_id"]: p for p in all_parents}
+    db = FAISS.from_documents(all_children, embeddings)
+    db.save_local(FAISS_PATH)
+    with open(CHUNKS_PATH, "wb") as f:
+        pickle.dump(all_children, f)
+    with open(PARENTS_PATH, "wb") as f:
+        pickle.dump(parent_lookup, f)
+
+    return db, all_children, all_parents, parent_lookup, file_stats
+
+# ── 9. Load existing DB ───────────────────────────────
+@st.cache_resource
+def load_existing_db():
+    if os.path.exists(FAISS_PATH) and os.path.exists(CHUNKS_PATH) and os.path.exists(PARENTS_PATH):
+        try:
+            db = FAISS.load_local(FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+            with open(CHUNKS_PATH, "rb") as f:
+                children = pickle.load(f)
+            with open(PARENTS_PATH, "rb") as f:
+                parent_lookup = pickle.load(f)
+            return db, children, parent_lookup
+        except:
+            return None, None, None
+    return None, None, None
+
+# ── 10. Build chain ───────────────────────────────────
+def build_chain(db, all_children, parent_lookup):
+    prompt = PromptTemplate(
+        template="""You are an expert assistant. Answer thoroughly using the context below.
+
+INSTRUCTIONS:
+- Use ALL relevant information from context
+- Be specific — quote facts, numbers, names
+- Only say "I don't have enough information" if context is truly empty
+
+Chat History:
+{history}
+
+Context:
+{context}
+
+Question: {question}
+
+Detailed Answer:""",
+        input_variables=["history", "context", "question"]
+    )
+
+    semantic_retriever = db.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 8, "fetch_k": 20, "lambda_mult": 0.5}
+    )
+    bm25_retriever = BM25Retriever.from_documents(all_children)
+    bm25_retriever.k = 6
+
+    def get_parents(docs):
+        seen, parents = set(), []
+        for doc in docs:
+            pid = doc.metadata.get("parent_id")
+            if pid and pid not in seen and pid in parent_lookup:
+                parents.append(parent_lookup[pid])
+                seen.add(pid)
+        return parents if parents else docs
+
+    def rerank_docs(query, semantic_docs, keyword_docs, top_n=4):
+        semantic_parents = get_parents(semantic_docs)
+        keyword_parents  = get_parents(keyword_docs[:2])
+        if semantic_parents:
+            pairs  = [(query, doc.page_content) for doc in semantic_parents]
+            scores = reranker.predict(pairs)
+            ranked = sorted(zip(scores, semantic_parents), key=lambda x: x[0], reverse=True)
+            top_semantic = [doc for _, doc in ranked[:top_n]]
+        else:
+            top_semantic = []
+        seen, final = set(), []
+        for doc in keyword_parents + top_semantic:
+            key = doc.metadata.get("parent_id", doc.page_content[:80])
+            if key not in seen:
+                final.append(doc)
+                seen.add(key)
+        return final
+
+    def format_docs(docs):
+        return "\n\n".join(
+            f"[Source: {d.metadata.get('source_file','?')} | Page: {d.metadata.get('page','?')}]\n{d.page_content}"
+            for d in docs
+        )
+
+    chain = (
+        {
+            "context":  lambda x: format_docs(rerank_docs(
+                x["question"],
+                semantic_retriever.invoke(x["expanded_query"]),
+                bm25_retriever.invoke(x["expanded_query"])
+            )),
+            "question": lambda x: x["question"],
+            "history":  lambda x: x["history"],
+        }
+        | prompt | llm | StrOutputParser()
+    )
+
+    hybrid_retriever = EnsembleRetriever(
+        retrievers=[semantic_retriever, bm25_retriever],
+        weights=[0.5, 0.5]
+    )
+
+    return chain, hybrid_retriever, rerank_docs, semantic_retriever, bm25_retriever
+
+# ── 11. Session state ─────────────────────────────────
+if "chat_id"        not in st.session_state: st.session_state.chat_id        = str(uuid.uuid4())[:8]
+if "messages"       not in st.session_state: st.session_state.messages       = []
+if "chat_title"     not in st.session_state: st.session_state.chat_title     = "New Chat"
+if "ingested_files" not in st.session_state: st.session_state.ingested_files = []
+
+SOURCE_COLORS = ["#818cf8","#f59e0b","#34d399","#f472b6"]
+CHUNK_COLORS  = {
+    "keyword bypass": "#f59e0b",
+    "semantic":       "#818cf8",
+    "reranked":       "#34d399",
+    "keyword match":  "#f472b6",
+}
+
+# ── 12. Load models ───────────────────────────────────
+embeddings = load_embeddings()
+reranker   = load_reranker()
+llm        = load_llm()
+
+# ── 13. SIDEBAR ───────────────────────────────────────
 with st.sidebar:
     st.markdown("""
     <div style="padding:14px 14px 10px 14px;border-bottom:1px solid #1c1c28;border-left:3px solid #f59e0b;margin-bottom:8px;">
@@ -295,15 +514,7 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    with st.spinner("Loading AI models..."):
-        embeddings = load_embeddings()
-        reranker   = load_reranker()
-        llm        = load_llm()
-
     st.markdown('<p class="section-label">Workspace</p>', unsafe_allow_html=True)
-
-    if "ingested_files" not in st.session_state:
-        st.session_state.ingested_files = []
 
     if st.session_state.ingested_files:
         for i, fname in enumerate(st.session_state.ingested_files):
@@ -394,7 +605,7 @@ with st.sidebar:
             """, unsafe_allow_html=True)
             col_a, col_b = st.columns([4, 1])
             with col_a:
-                if st.button(f"↗ Open", key=f"load_{c['id']}", use_container_width=True):
+                if st.button("↗ Open", key=f"load_{c['id']}", use_container_width=True):
                     st.session_state.chat_id    = c["id"]
                     st.session_state.messages   = c["messages"]
                     st.session_state.chat_title = c["title"]
@@ -404,224 +615,7 @@ with st.sidebar:
                     delete_chat(c["id"])
                     st.rerun()
 
-
-def expand_query(query):
-    prompt = f"""Generate 8-10 additional keywords to help find relevant information. Return ONLY the expanded query as a single line.
-
-Original: {query}
-Expanded:"""
-    r = llm.invoke(prompt)
-    text = r.content if hasattr(r, "content") else r
-    return f"{query} {text}"
-
-def rewrite_query(question, history):
-    if not history or history == "No prior conversation.":
-        return question
-    prompt = f"""Rewrite the question to be fully self-contained. Return ONLY the rewritten question.
-
-History:
-{history}
-
-Question: {question}
-Rewritten:"""
-    r = llm.invoke(prompt)
-    text = r.content if hasattr(r, "content") else r
-    return text.strip()
-
-def check_hallucination(question, answer, source_docs):
-    context = "\n\n".join(doc.page_content for doc in source_docs)
-    prompt = f"""Fact-check: is the answer supported by the context?
-Note: admitting missing info = GROUNDED.
-
-Context:
-{context[:6000]}
-
-Question: {question}
-Answer: {answer}
-
-Reply ONLY with one of:
-GROUNDED - fully or mostly supported
-PARTIAL - some claims not in context
-HALLUCINATED - significant fabricated info"""
-    r = llm.invoke(prompt)
-    text = r.content if hasattr(r, "content") else r
-    return text.strip()
-
-
-def ingest_files(file_paths, append=False):
-    new_parents, new_children, file_stats = [], [], []
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=3000, chunk_overlap=200)
-    child_splitter  = RecursiveCharacterTextSplitter(chunk_size=200,  chunk_overlap=20)
-
-    for file_path in file_paths:
-        ext      = os.path.splitext(file_path)[-1].lower()
-        filename = os.path.basename(file_path).replace("temp_", "")
-        if ext == ".pdf":
-            loader = PyPDFLoader(file_path)
-        elif ext in [".xlsx", ".xls"]:
-            loader = UnstructuredExcelLoader(file_path, mode="elements")
-        elif ext in [".docx", ".doc"]:
-            loader = Docx2txtLoader(file_path)
-        else:
-            st.warning(f"Skipping: {filename}")
-            continue
-
-        docs = loader.load()
-        for d in docs:
-            d.metadata["source_file"] = filename
-
-        parents = parent_splitter.split_documents(docs)
-        for i, p in enumerate(parents):
-            p.metadata["parent_id"] = f"{filename}_{i}"
-        new_parents.extend(parents)
-
-        for i, p in enumerate(parents):
-            children = child_splitter.split_documents([p])
-            for c in children:
-                c.metadata["parent_id"] = f"{filename}_{i}"
-            new_children.extend(children)
-
-        file_stats.append((filename, len(docs), len(parents), len(new_children)))
-
-    if append and os.path.exists(CHUNKS_PATH) and os.path.exists(PARENTS_PATH):
-        with open(CHUNKS_PATH, "rb") as f:
-            existing_children = pickle.load(f)
-        with open(PARENTS_PATH, "rb") as f:
-            existing_parents = pickle.load(f)
-        all_children = existing_children + new_children
-        all_parents  = existing_parents  + new_parents
-    else:
-        all_children = new_children
-        all_parents  = new_parents
-
-    if not all_children:
-        st.error("No text extracted. File may be scanned/image-based.")
-        return None, None, None, None, None
-
-    parent_lookup = {p.metadata["parent_id"]: p for p in all_parents}
-    db = FAISS.from_documents(all_children, embeddings)
-    db.save_local(FAISS_PATH)
-    with open(CHUNKS_PATH, "wb") as f:
-        pickle.dump(all_children, f)
-    with open(PARENTS_PATH, "wb") as f:
-        pickle.dump(parent_lookup, f)
-
-    return db, all_children, all_parents, parent_lookup, file_stats
-
-@st.cache_resource
-def load_existing_db():
-    if os.path.exists(FAISS_PATH) and os.path.exists(CHUNKS_PATH) and os.path.exists(PARENTS_PATH):
-        try:
-            db = FAISS.load_local(FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
-            with open(CHUNKS_PATH, "rb") as f:
-                children = pickle.load(f)
-            with open(PARENTS_PATH, "rb") as f:
-                parent_lookup = pickle.load(f)
-            return db, children, parent_lookup
-        except:
-            return None, None, None
-    return None, None, None
-
-
-def build_chain(db, all_children, parent_lookup):
-    prompt = PromptTemplate(
-        template="""You are an expert assistant. Answer thoroughly using the context below.
-
-INSTRUCTIONS:
-- Use ALL relevant information from context
-- Be specific — quote facts, numbers, names
-- Only say "I don't have enough information" if context is truly empty
-
-Chat History:
-{history}
-
-Context:
-{context}
-
-Question: {question}
-
-Detailed Answer:""",
-        input_variables=["history", "context", "question"]
-    )
-
-    semantic_retriever = db.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": 8, "fetch_k": 20, "lambda_mult": 0.5}
-    )
-    bm25_retriever = BM25Retriever.from_documents(all_children)
-    bm25_retriever.k = 6
-
-    def get_parents(docs):
-        seen, parents = set(), []
-        for doc in docs:
-            pid = doc.metadata.get("parent_id")
-            if pid and pid not in seen and pid in parent_lookup:
-                parents.append(parent_lookup[pid])
-                seen.add(pid)
-        return parents if parents else docs
-
-    def rerank_docs(query, semantic_docs, keyword_docs, top_n=4):
-        semantic_parents = get_parents(semantic_docs)
-        keyword_parents  = get_parents(keyword_docs[:2])
-        if semantic_parents:
-            pairs  = [(query, doc.page_content) for doc in semantic_parents]
-            scores = reranker.predict(pairs)
-            ranked = sorted(zip(scores, semantic_parents), key=lambda x: x[0], reverse=True)
-            top_semantic = [doc for _, doc in ranked[:top_n]]
-        else:
-            top_semantic = []
-        seen, final = set(), []
-        for doc in keyword_parents + top_semantic:
-            key = doc.metadata.get("parent_id", doc.page_content[:80])
-            if key not in seen:
-                final.append(doc)
-                seen.add(key)
-        return final
-
-    def format_docs(docs):
-        return "\n\n".join(
-            f"[Source: {d.metadata.get('source_file','?')} | Page: {d.metadata.get('page','?')}]\n{d.page_content}"
-            for d in docs
-        )
-
-    chain = (
-        {
-            "context":  lambda x: format_docs(rerank_docs(
-                x["question"],
-                semantic_retriever.invoke(x["expanded_query"]),
-                bm25_retriever.invoke(x["expanded_query"])
-            )),
-            "question": lambda x: x["question"],
-            "history":  lambda x: x["history"],
-        }
-        | prompt | llm | StrOutputParser()
-    )
-
-    hybrid_retriever = EnsembleRetriever(
-        retrievers=[semantic_retriever, bm25_retriever],
-        weights=[0.5, 0.5]
-    )
-
-    return chain, hybrid_retriever, rerank_docs, semantic_retriever, bm25_retriever
-
-def format_history(messages, last_n=4):
-    recent = messages[-last_n*2:]
-    return "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in recent) if recent else "No prior conversation."
-
-
-if "chat_id"        not in st.session_state: st.session_state.chat_id        = str(uuid.uuid4())[:8]
-if "messages"       not in st.session_state: st.session_state.messages       = []
-if "chat_title"     not in st.session_state: st.session_state.chat_title     = "New Chat"
-if "ingested_files" not in st.session_state: st.session_state.ingested_files = []
-
-SOURCE_COLORS = ["#818cf8","#f59e0b","#34d399","#f472b6"]
-CHUNK_COLORS  = {
-    "keyword bypass": "#f59e0b",
-    "semantic":       "#818cf8",
-    "reranked":       "#34d399",
-    "keyword match":  "#f472b6",
-}
-
+# ── 14. MAIN CHAT ─────────────────────────────────────
 if "rag_chain" not in st.session_state:
     st.markdown("""
     <div class="welcome-box">
@@ -834,11 +828,9 @@ else:
                 })
 
                 save_chat(st.session_state.chat_id, st.session_state.messages, st.session_state.chat_title)
-                st.session_state.last_chunks          = final_docs
-                st.session_state.last_scores          = scores
-                st.session_state.last_retrieval_types = retrieval_types
                 st.rerun()
 
+    # ── 15. CONTEXT WINDOW ────────────────────────────
     with ctx_col:
         st.markdown("""
         <div style="padding:0.5rem 0 0.8rem 0.5rem;border-bottom:1px solid #1c1c28;border-left:3px solid #38bdf8;margin-bottom:0.8rem;">
@@ -869,9 +861,9 @@ else:
             """, unsafe_allow_html=True)
 
             for i, chunk in enumerate(chunks):
-                color      = CHUNK_COLORS.get(chunk["type"], "#818cf8")
-                raw_score  = chunk["score"]
-                score_bar  = int(min(abs(raw_score) / 15 * 100, 100))
+                color     = CHUNK_COLORS.get(chunk["type"], "#818cf8")
+                raw_score = chunk["score"]
+                score_bar = int(min(abs(raw_score) / 15 * 100, 100))
                 st.markdown(f"""
                 <div class="chunk-card" style="border-left-color:{color};">
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
