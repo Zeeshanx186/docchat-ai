@@ -3,6 +3,9 @@ import os
 import json
 import uuid
 import pickle
+import warnings
+warnings.filterwarnings("ignore")
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 from datetime import datetime
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
@@ -47,6 +50,21 @@ st.markdown("""
 <style>
 #MainMenu, footer, header {visibility: hidden;}
 * {box-sizing: border-box;}
+
+/* Force sidebar always visible */
+[data-testid="stSidebar"] {
+    display: block !important;
+    visibility: visible !important;
+    min-width: 240px !important;
+    background: #0e0e14 !important;
+    border-right: 1px solid #1c1c28 !important;
+}
+section[data-testid="stSidebarContent"] {
+    display: block !important;
+    visibility: visible !important;
+}
+[data-testid="stSidebar"] > div {padding: 0 !important;}
+
 .stApp {
     background: #0a0a0e;
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
@@ -66,12 +84,6 @@ h1 {
 }
 h2, h3, h4 {color: #e2e8f0 !important; font-weight: 600 !important;}
 p, .stCaption, label {color: #6b7280 !important; font-size: 0.78rem !important;}
-
-[data-testid="stSidebar"] {
-    background: #0e0e14 !important;
-    border-right: 1px solid #1c1c28 !important;
-}
-[data-testid="stSidebar"] > div {padding: 0 !important;}
 
 [data-testid="stFileUploader"] {
     background: #0c0c12;
@@ -96,7 +108,6 @@ p, .stCaption, label {color: #6b7280 !important; font-size: 0.78rem !important;}
     transform: translateY(-1px) !important;
     box-shadow: 0 4px 16px rgba(245,158,11,0.3) !important;
 }
-
 [data-testid="stSidebar"] .stButton > button {
     background: transparent !important;
     color: #6b7280 !important;
@@ -115,7 +126,6 @@ p, .stCaption, label {color: #6b7280 !important; font-size: 0.78rem !important;}
     transform: none !important;
     box-shadow: none !important;
 }
-
 [data-testid="stChatMessage"] {
     background: #0e0e16;
     border: 1px solid #1c1c28;
@@ -271,9 +281,128 @@ def load_reranker():
 def load_llm():
     return ChatGroq(api_key=GROQ_API_KEY, model="openai/gpt-oss-120b", temperature=0)
 
-embeddings = load_embeddings()
-reranker   = load_reranker()
-llm        = load_llm()
+# Load models with visible status
+with st.sidebar:
+    st.markdown("""
+    <div style="padding:14px 14px 10px 14px;border-bottom:1px solid #1c1c28;border-left:3px solid #f59e0b;margin-bottom:8px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+            <div style="width:30px;height:30px;border-radius:8px;background:#1a1505;border:1px solid rgba(245,158,11,0.4);display:flex;align-items:center;justify-content:center;font-weight:700;color:#f59e0b;font-size:14px;">D</div>
+            <div>
+                <div style="color:#f1f1f4;font-weight:700;font-size:13px;line-height:1.2;">DocChat AI</div>
+                <div style="color:#f59e0b;font-size:9px;">Hybrid RAG · Zero Cost</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.spinner("Loading AI models..."):
+        embeddings = load_embeddings()
+        reranker   = load_reranker()
+        llm        = load_llm()
+
+    st.markdown('<p class="section-label">Workspace</p>', unsafe_allow_html=True)
+
+    if "ingested_files" not in st.session_state:
+        st.session_state.ingested_files = []
+
+    if st.session_state.ingested_files:
+        for i, fname in enumerate(st.session_state.ingested_files):
+            active     = i == 0
+            card_class = "doc-card-active" if active else "doc-card"
+            badge      = '<span style="color:#34d399;font-size:9px;">● active</span>' if active else ""
+            st.markdown(f"""
+            <div class="{card_class}">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div>
+                        <div style="color:#f1f1f4;font-size:10px;font-weight:500;">📄 {fname[:26]}</div>
+                        <div style="color:#3d3d52;font-size:8px;margin-top:2px;">ingested</div>
+                    </div>
+                    {badge}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    uploaded_files = st.file_uploader(
+        "Drop files here",
+        type=["pdf", "xlsx", "xls", "docx", "doc"],
+        accept_multiple_files=True,
+        label_visibility="collapsed"
+    )
+
+    append_mode = st.toggle("Append to existing docs", value=False)
+
+    if uploaded_files and st.button("⚡ Ingest Documents", use_container_width=True):
+        saved_paths = []
+        for f in uploaded_files:
+            p = f"/tmp/temp_{f.name}"
+            with open(p, "wb") as fp:
+                fp.write(f.getbuffer())
+            saved_paths.append(p)
+
+        with st.spinner("Ingesting..."):
+            result = ingest_files(saved_paths, append=append_mode)
+            for p in saved_paths:
+                os.remove(p)
+
+        if result[0] is not None:
+            db, all_children, all_parents, parent_lookup, file_stats = result
+            chain, retriever, rerank_fn, sem_ret, bm25_ret = build_chain(db, all_children, parent_lookup)
+            st.session_state.rag_chain      = chain
+            st.session_state.retriever      = retriever
+            st.session_state.rerank_fn      = rerank_fn
+            st.session_state.sem_ret        = sem_ret
+            st.session_state.bm25_ret       = bm25_ret
+            st.session_state.parent_lookup  = parent_lookup
+            st.session_state.ingested_files = [s[0] for s in file_stats]
+            st.success(f"✅ {len(file_stats)} file(s) ready")
+            for name, pages, parents, children in file_stats:
+                st.caption(f"📄 {name} · {pages}p · {parents} parents · {children} children")
+
+    if "rag_chain" not in st.session_state:
+        existing_db, existing_children, existing_parents = load_existing_db()
+        if existing_db and existing_children and existing_parents:
+            chain, retriever, rerank_fn, sem_ret, bm25_ret = build_chain(existing_db, existing_children, existing_parents)
+            st.session_state.rag_chain     = chain
+            st.session_state.retriever     = retriever
+            st.session_state.rerank_fn     = rerank_fn
+            st.session_state.sem_ret       = sem_ret
+            st.session_state.bm25_ret      = bm25_ret
+            st.session_state.parent_lookup = existing_parents
+
+    st.markdown("---")
+
+    if st.button("＋ New Conversation", use_container_width=True):
+        st.session_state.chat_id    = str(uuid.uuid4())[:8]
+        st.session_state.messages   = []
+        st.session_state.chat_title = "New Chat"
+        st.rerun()
+
+    st.markdown('<p class="section-label">Recent Chats</p>', unsafe_allow_html=True)
+    chats = list_chats()
+    if not chats:
+        st.markdown('<p style="color:#2a2a38;font-size:9px;padding:0 14px;">No previous chats</p>', unsafe_allow_html=True)
+    else:
+        for c in chats[:15]:
+            is_active  = c["id"] == st.session_state.chat_id
+            card_class = "chat-item-active" if is_active else "chat-item"
+            label      = time_label(c.get("updated_at",""))
+            st.markdown(f"""
+            <div class="{card_class}">
+                <div style="color:#3d3d52;font-size:7px;">{label}</div>
+                <div style="color:{'#e2e8f0' if is_active else '#6b7280'};font-size:9px;font-weight:{'500' if is_active else '400'};">{c['title'][:30]}</div>
+            </div>
+            """, unsafe_allow_html=True)
+            col_a, col_b = st.columns([4, 1])
+            with col_a:
+                if st.button(f"↗ Open", key=f"load_{c['id']}", use_container_width=True):
+                    st.session_state.chat_id    = c["id"]
+                    st.session_state.messages   = c["messages"]
+                    st.session_state.chat_title = c["title"]
+                    st.rerun()
+            with col_b:
+                if st.button("🗑", key=f"del_{c['id']}"):
+                    delete_chat(c["id"])
+                    st.rerun()
 
 
 def expand_query(query):
@@ -480,126 +609,18 @@ def format_history(messages, last_n=4):
     return "\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in recent) if recent else "No prior conversation."
 
 
-if "chat_id"         not in st.session_state: st.session_state.chat_id         = str(uuid.uuid4())[:8]
-if "messages"        not in st.session_state: st.session_state.messages        = []
-if "chat_title"      not in st.session_state: st.session_state.chat_title      = "New Chat"
-if "ingested_files"  not in st.session_state: st.session_state.ingested_files  = []
+if "chat_id"        not in st.session_state: st.session_state.chat_id        = str(uuid.uuid4())[:8]
+if "messages"       not in st.session_state: st.session_state.messages       = []
+if "chat_title"     not in st.session_state: st.session_state.chat_title     = "New Chat"
+if "ingested_files" not in st.session_state: st.session_state.ingested_files = []
 
-
-with st.sidebar:
-    st.markdown("""
-    <div style="padding:14px 14px 10px 14px;border-bottom:1px solid #1c1c28;border-left:3px solid #f59e0b;margin-bottom:8px;">
-        <div style="display:flex;align-items:center;gap:10px;">
-            <div style="width:30px;height:30px;border-radius:8px;background:#1a1505;border:1px solid rgba(245,158,11,0.4);display:flex;align-items:center;justify-content:center;font-weight:700;color:#f59e0b;font-size:14px;">D</div>
-            <div>
-                <div style="color:#f1f1f4;font-weight:700;font-size:13px;line-height:1.2;">DocChat AI</div>
-                <div style="color:#f59e0b;font-size:9px;">Hybrid RAG · Zero Cost</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown('<p class="section-label">Workspace</p>', unsafe_allow_html=True)
-
-    if st.session_state.ingested_files:
-        for i, fname in enumerate(st.session_state.ingested_files):
-            active     = i == 0
-            card_class = "doc-card-active" if active else "doc-card"
-            badge      = '<span style="color:#34d399;font-size:9px;">● active</span>' if active else ""
-            st.markdown(f"""
-            <div class="{card_class}">
-                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                    <div>
-                        <div style="color:#f1f1f4;font-size:10px;font-weight:500;">📄 {fname[:26]}</div>
-                        <div style="color:#3d3d52;font-size:8px;margin-top:2px;">ingested</div>
-                    </div>
-                    {badge}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-    uploaded_files = st.file_uploader(
-        "Drop files here",
-        type=["pdf", "xlsx", "xls", "docx", "doc"],
-        accept_multiple_files=True,
-        label_visibility="collapsed"
-    )
-
-    append_mode = st.toggle("Append to existing docs", value=False)
-
-    if uploaded_files and st.button("⚡ Ingest Documents", use_container_width=True):
-        saved_paths = []
-        for f in uploaded_files:
-            p = f"/tmp/temp_{f.name}"
-            with open(p, "wb") as fp:
-                fp.write(f.getbuffer())
-            saved_paths.append(p)
-
-        with st.spinner("Ingesting..."):
-            result = ingest_files(saved_paths, append=append_mode)
-            for p in saved_paths:
-                os.remove(p)
-
-        if result[0] is not None:
-            db, all_children, all_parents, parent_lookup, file_stats = result
-            chain, retriever, rerank_fn, sem_ret, bm25_ret = build_chain(db, all_children, parent_lookup)
-            st.session_state.rag_chain      = chain
-            st.session_state.retriever      = retriever
-            st.session_state.rerank_fn      = rerank_fn
-            st.session_state.sem_ret        = sem_ret
-            st.session_state.bm25_ret       = bm25_ret
-            st.session_state.parent_lookup  = parent_lookup
-            st.session_state.ingested_files = [s[0] for s in file_stats]
-            st.success(f"✅ {len(file_stats)} file(s) ready")
-            for name, pages, parents, children in file_stats:
-                st.caption(f"📄 {name} · {pages}p · {parents} parents · {children} children")
-
-    if "rag_chain" not in st.session_state:
-        existing_db, existing_children, existing_parents = load_existing_db()
-        if existing_db and existing_children and existing_parents:
-            chain, retriever, rerank_fn, sem_ret, bm25_ret = build_chain(existing_db, existing_children, existing_parents)
-            st.session_state.rag_chain     = chain
-            st.session_state.retriever     = retriever
-            st.session_state.rerank_fn     = rerank_fn
-            st.session_state.sem_ret       = sem_ret
-            st.session_state.bm25_ret      = bm25_ret
-            st.session_state.parent_lookup = existing_parents
-
-    st.markdown("---")
-
-    if st.button("＋ New Conversation", use_container_width=True):
-        st.session_state.chat_id    = str(uuid.uuid4())[:8]
-        st.session_state.messages   = []
-        st.session_state.chat_title = "New Chat"
-        st.rerun()
-
-    st.markdown('<p class="section-label">Recent Chats</p>', unsafe_allow_html=True)
-    chats = list_chats()
-    if not chats:
-        st.markdown('<p style="color:#2a2a38;font-size:9px;padding:0 14px;">No previous chats</p>', unsafe_allow_html=True)
-    else:
-        for c in chats[:15]:
-            is_active  = c["id"] == st.session_state.chat_id
-            card_class = "chat-item-active" if is_active else "chat-item"
-            label      = time_label(c.get("updated_at",""))
-            st.markdown(f"""
-            <div class="{card_class}">
-                <div style="color:#3d3d52;font-size:7px;">{label}</div>
-                <div style="color:{'#e2e8f0' if is_active else '#6b7280'};font-size:9px;font-weight:{'500' if is_active else '400'};">{c['title'][:30]}</div>
-            </div>
-            """, unsafe_allow_html=True)
-            col_a, col_b = st.columns([4, 1])
-            with col_a:
-                if st.button(f"↗ Open", key=f"load_{c['id']}", use_container_width=True):
-                    st.session_state.chat_id    = c["id"]
-                    st.session_state.messages   = c["messages"]
-                    st.session_state.chat_title = c["title"]
-                    st.rerun()
-            with col_b:
-                if st.button("🗑", key=f"del_{c['id']}"):
-                    delete_chat(c["id"])
-                    st.rerun()
-
+SOURCE_COLORS = ["#818cf8","#f59e0b","#34d399","#f472b6"]
+CHUNK_COLORS  = {
+    "keyword bypass": "#f59e0b",
+    "semantic":       "#818cf8",
+    "reranked":       "#34d399",
+    "keyword match":  "#f472b6",
+}
 
 if "rag_chain" not in st.session_state:
     st.markdown("""
@@ -620,8 +641,6 @@ else:
             <div style="color:#e2e8f0;font-size:13px;font-weight:600;">{st.session_state.chat_title}</div>
         </div>
         """, unsafe_allow_html=True)
-
-        SOURCE_COLORS = ["#818cf8","#f59e0b","#34d399","#f472b6"]
 
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"], avatar="🧑" if msg["role"] == "user" else "🤖"):
@@ -691,7 +710,7 @@ else:
                 st.session_state.chat_title = question[:50]
 
             with st.chat_message("assistant", avatar="🤖"):
-                history      = format_history(st.session_state.messages[:-1])
+                history       = format_history(st.session_state.messages[:-1])
                 pipeline_info = {}
 
                 with st.spinner("① Rewriting query..."):
@@ -726,7 +745,6 @@ else:
                 with st.spinner("Checking for hallucinations..."):
                     hallucination_status = check_hallucination(question, full_answer, source_docs)
 
-                # Pipeline pills
                 steps = [
                     ("#818cf8", "① Rewrite ✓"),
                     ("#f59e0b", f"② Expand +{pipeline_info.get('keywords',8)}kw ✓"),
@@ -741,7 +759,6 @@ else:
                 ])
                 st.markdown(f'<div style="margin:0.4rem 0;">{pills}</div>', unsafe_allow_html=True)
 
-                # Confidence badge
                 status = hallucination_status.split()[0]
                 badge_map = {
                     "GROUNDED":     ("✓ Grounded",               "#34d399","#0d2010", 87),
@@ -760,7 +777,6 @@ else:
                 </div>
                 """, unsafe_allow_html=True)
 
-                # Sources
                 retrieval_types = (
                     ["keyword bypass"] * min(2, len(bm25_docs)) +
                     ["semantic"] * len(sem_docs)
@@ -769,7 +785,7 @@ else:
                 for i, doc in enumerate(source_docs):
                     key = (doc.metadata.get("source_file","?"), doc.metadata.get("page","?"))
                     if key not in seen:
-                        raw_score = float(scores[i]) if i < len(scores) else 0
+                        raw_score  = float(scores[i]) if i < len(scores) else 0
                         norm_score = round(max(0, min(1, (raw_score + 10) / 20)), 2)
                         sources.append({
                             "file":           doc.metadata.get("source_file","Unknown"),
@@ -831,23 +847,16 @@ else:
         </div>
         """, unsafe_allow_html=True)
 
-        CHUNK_COLORS = {
-            "keyword bypass": "#f59e0b",
-            "semantic":       "#818cf8",
-            "reranked":       "#34d399",
-            "keyword match":  "#f472b6",
-        }
-
         last_msg = next(
             (m for m in reversed(st.session_state.messages) if m["role"] == "assistant"),
             None
         )
 
         if last_msg and "context_chunks" in last_msg:
-            chunks = last_msg["context_chunks"]
+            chunks      = last_msg["context_chunks"]
             total_chars = sum(len(c["text"]) for c in chunks)
             est_tokens  = total_chars // 4
-            bar_w = min(int(est_tokens / 80), 100)
+            bar_w       = min(int(est_tokens / 80), 100)
 
             st.markdown(f"""
             <div style="background:#111119;border:1px solid #1c1c28;border-radius:8px;padding:0.6rem;margin-bottom:0.5rem;">
@@ -861,10 +870,8 @@ else:
 
             for i, chunk in enumerate(chunks):
                 color      = CHUNK_COLORS.get(chunk["type"], "#818cf8")
-                type_label = chunk["type"]
                 raw_score  = chunk["score"]
                 score_bar  = int(min(abs(raw_score) / 15 * 100, 100))
-
                 st.markdown(f"""
                 <div class="chunk-card" style="border-left-color:{color};">
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -876,7 +883,7 @@ else:
                     <div style="background:#1c1c28;border-radius:2px;height:3px;margin-top:6px;">
                         <div style="background:{color};width:{score_bar}%;height:3px;border-radius:2px;opacity:0.5;"></div>
                     </div>
-                    <div style="color:#3d3d52;font-size:0.68rem;margin-top:3px;">{type_label}</div>
+                    <div style="color:#3d3d52;font-size:0.68rem;margin-top:3px;">{chunk['type']}</div>
                 </div>
                 """, unsafe_allow_html=True)
 
